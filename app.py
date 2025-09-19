@@ -22,33 +22,52 @@ from sqlalchemy.orm.exc import NoResultFound
 import requests
 from flask_login import current_user, LoginManager, login_user, UserMixin
 import folium
+from flask_cors import CORS
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = secrets.token_hex(16)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///banking.db'
+
+# Configuration
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(16))
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///banking.db').replace('postgres://', 'postgresql://')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif'}
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB max
 
-# IMPORTANT: Replace these dummy values with your actual Google OAuth credentials.
-# You can get these from the Google Cloud Console: https://console.cloud.com/apis/credentials
-# For development, you can set them as environment variables or replace the dummy strings directly.
+# JWT Configuration
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', secrets.token_hex(32))
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
+
+# Email Configuration
+app.config['MAIL_SERVER'] = os.environ.get('MAIL_SERVER', 'smtp.gmail.com')
+app.config['MAIL_PORT'] = int(os.environ.get('MAIL_PORT', 587))
+app.config['MAIL_USE_TLS'] = os.environ.get('MAIL_USE_TLS', 'True').lower() == 'true'
+app.config['MAIL_USE_SSL'] = os.environ.get('MAIL_USE_SSL', 'False').lower() == 'true'
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
+app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_DEFAULT_SENDER', 'noreply@ghanabank.com')
+
+# Google OAuth Configuration
 app.config['GOOGLE_OAUTH_CLIENT_ID'] = os.environ.get('GOOGLE_OAUTH_CLIENT_ID', 'DUMMY_CLIENT_ID_REPLACE_ME')
 app.config['GOOGLE_OAUTH_CLIENT_SECRET'] = os.environ.get('GOOGLE_OAUTH_CLIENT_SECRET', 'DUMMY_CLIENT_SECRET_REPLACE_ME')
+
+# CORS Configuration for Flutter app
+CORS(app, origins=[
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+    "https://your-flutter-app.com",  # Replace with your Flutter app domain
+    "http://localhost",  # For Android emulator
+    "http://10.0.2.2:5000",  # For Android emulator
+], supports_credentials=True)
 
 # Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Mail configuration for local SMTP
-app.config['MAIL_SERVER'] = 'localhost'
-app.config['MAIL_PORT'] = 1025
-app.config['MAIL_USE_TLS'] = False
-app.config['MAIL_USE_SSL'] = False
-app.config['MAIL_DEFAULT_SENDER'] = 'noreply@ghanabank.com'
-
+# Initialize extensions
 db = SQLAlchemy(app)
 mail = Mail(app)
+jwt = JWTManager(app)
 
 # Setup login manager
 login_manager = LoginManager()
@@ -224,7 +243,7 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
-            return redirect(url_for('login'))
+            return jsonify({'error': 'Authentication required'}), 401
         return f(*args, **kwargs)
     return decorated_function
 
@@ -371,23 +390,13 @@ def google_error(blueprint, error, error_description=None, error_uri=None):
     )
     flash(msg, "error")
 
-# Routes
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-@app.route('/')
-def index():
-    if 'user_id' in session:
-        return redirect(url_for('dashboard'))
-    return redirect(url_for('login'))
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        email_or_phone = request.form.get('email_or_phone')
-        password = request.form.get('password')
-        remember_me = request.form.get('remember_me')
+# API Routes for Flutter App
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    try:
+        data = request.get_json()
+        email_or_phone = data.get('email_or_phone')
+        password = data.get('password')
         
         # Find user by email or phone
         user = User.query.filter(
@@ -395,180 +404,249 @@ def login():
         ).first()
         
         if user and user.password_hash and check_password_hash(user.password_hash, password):
-            session['user_id'] = user.id
-            session['user_name'] = user.full_name
-            session['profile_image'] = user.profile_image
+            # Create JWT token
+            access_token = create_access_token(identity=user.id)
             
-            # Log in with Flask-Login
-            login_user(user)
-            
-            if remember_me:
-                session.permanent = True
-                app.permanent_session_lifetime = timedelta(days=30)
-            
-            flash('Login successful!', 'success')
-            return redirect(url_for('dashboard'))
+            return jsonify({
+                'success': True,
+                'user': {
+                    'id': user.id,
+                    'full_name': user.full_name,
+                    'email': user.email,
+                    'phone': user.phone,
+                    'checking_balance': user.checking_balance,
+                    'savings_balance': user.savings_balance,
+                    'profile_image': user.profile_image,
+                    'checking_account': user.checking_account,
+                    'savings_account': user.savings_account
+                },
+                'access_token': access_token
+            })
         else:
-            flash('Invalid email/phone or password', 'error')
-    
-    return render_template('login.html')
-
-@app.route('/login/google')
-def google_login():
-    if not google.authorized:
-        return redirect(url_for('google.login'))
-    
-    try:
-        resp = google.get("/oauth2/v1/userinfo")
-        if resp.ok:
-            return redirect(url_for('dashboard'))
-        else:
-            flash("Google authentication failed", "error")
-            return redirect(url_for('login'))
+            return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
+            
     except Exception as e:
-        flash(f"Error during Google authentication: {str(e)}", "error")
-        return redirect(url_for('login'))
+        return jsonify({'success': False, 'message': f'Server error: {str(e)}'}), 500
 
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'POST':
-        # Get form data
-        full_name = request.form.get('full_name')
-        email = request.form.get('email')
-        phone = request.form.get('phone')
-        date_of_birth = request.form.get('date_of_birth')
-        gps_address = request.form.get('gps_address')
-        ghana_card_id = request.form.get('ghana_card_id')
-        password = request.form.get('password')
-        confirm_password = request.form.get('confirm_password')
-        checking_account = request.form.get('checking_account')
-        savings_account = request.form.get('savings_account')
+@app.route('/api/register', methods=['POST'])
+def api_register():
+    try:
+        data = request.get_json()
         
-        # Validation
-        if password != confirm_password:
-            flash('Passwords do not match', 'error')
-            return render_template('signup.html')
+        # Validate required fields
+        required_fields = ['full_name', 'email', 'password', 'confirm_password']
+        for field in required_fields:
+            if not data.get(field):
+                return jsonify({'success': False, 'message': f'{field.replace("_", " ").title()} is required'}), 400
         
-        is_valid, message = validate_password(password)
+        # Validate password match
+        if data['password'] != data['confirm_password']:
+            return jsonify({'success': False, 'message': 'Passwords do not match'}), 400
+        
+        # Validate password strength
+        is_valid, message = validate_password(data['password'])
         if not is_valid:
-            flash(message, 'error')
-            return render_template('signup.html')
-        
-        if not validate_ghana_card(ghana_card_id):
-            flash('Invalid Ghana Card ID format. Use: GHA-XXXXXXXXX-X', 'error')
-            return render_template('signup.html')
-        
-        if not validate_gps_address(gps_address):
-            flash('Invalid GPS address format. Use: XX-XXXX-XXXX', 'error')
-            return render_template('signup.html')
+            return jsonify({'success': False, 'message': message}), 400
         
         # Check if user already exists
-        if User.query.filter_by(email=email).first():
-            flash('Email already registered', 'error')
-            return render_template('signup.html')
-        
-        if phone and User.query.filter_by(phone=phone).first():
-            flash('Phone number already registered', 'error')
-            return render_template('signup.html')
-        
-        if ghana_card_id and User.query.filter_by(ghana_card_id=ghana_card_id).first():
-            flash('Ghana Card ID already registered', 'error')
-            return render_template('signup.html')
+        if User.query.filter_by(email=data['email']).first():
+            return jsonify({'success': False, 'message': 'Email already registered'}), 400
         
         # Create new user
         user = User(
-            full_name=full_name,
-            email=email,
-            phone=phone,
-            date_of_birth=datetime.strptime(date_of_birth, '%Y-%m-%d').date() if date_of_birth else None,
-            gps_address=gps_address,
-            ghana_card_id=ghana_card_id,
-            password_hash=generate_password_hash(password),
-            checking_account=checking_account or generate_account_number(),
-            savings_account=savings_account or generate_account_number()
+            full_name=data['full_name'],
+            email=data['email'],
+            phone=data.get('phone'),
+            date_of_birth=datetime.strptime(data['date_of_birth'], '%Y-%m-%d').date() if data.get('date_of_birth') else None,
+            gps_address=data.get('gps_address'),
+            ghana_card_id=data.get('ghana_card_id'),
+            password_hash=generate_password_hash(data['password']),
+            checking_account=generate_account_number(),
+            savings_account=generate_account_number()
         )
         
         db.session.add(user)
         db.session.commit()
         
-        # Send welcome email
-        send_email(
-            user.email,
-            'Welcome to Ghana Bank',
-            'emails/welcome.html',
-            user=user
-        )
+        # Create JWT token
+        access_token = create_access_token(identity=user.id)
         
-        flash('Registration successful! Please login.', 'success')
-        return redirect(url_for('login'))
-    
-    return render_template('signup.html')
-
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    user = User.query.get(session['user_id'])
-    recent_transactions = Transaction.query.filter_by(user_id=user.id).order_by(Transaction.created_at.desc()).limit(5).all()
-    return render_template('dashboard.html', user=user, transactions=recent_transactions)
-
-@app.route('/bank_hub')
-@login_required
-def bank_hub():
-    user = User.query.get(session['user_id'])
-    
-    # Get linked bank accounts
-    linked_accounts = ExternalBankAccount.query.filter_by(user_id=user.id).all()
-    
-    # Format linked accounts with bank names
-    formatted_accounts = []
-    for account in linked_accounts:
-        bank_name = BANKS.get(account.bank_code, {}).get('name', account.bank_code)
-        formatted_accounts.append({
-            'bank_name': bank_name,
-            'account_name': account.account_name,
-            'account_number': account.account_number
+        return jsonify({
+            'success': True,
+            'message': 'Registration successful',
+            'user': {
+                'id': user.id,
+                'full_name': user.full_name,
+                'email': user.email,
+                'phone': user.phone,
+                'checking_balance': user.checking_balance,
+                'savings_balance': user.savings_balance,
+                'checking_account': user.checking_account,
+                'savings_account': user.savings_account
+            },
+            'access_token': access_token
         })
-    
-    return render_template('bank_hub.html', 
-                          user=user, 
-                          linked_accounts=formatted_accounts)
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Registration failed: {str(e)}'}), 500
 
-@app.route('/logout')
-def logout():
-    session.clear()
-    flash('You have been logged out', 'info')
-    return redirect(url_for('login'))
+@app.route('/api/user', methods=['GET'])
+@jwt_required()
+def api_get_user():
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({'success': False, 'message': 'User not found'}), 404
+            
+        return jsonify({
+            'success': True,
+            'user': {
+                'id': user.id,
+                'full_name': user.full_name,
+                'email': user.email,
+                'phone': user.phone,
+                'checking_balance': user.checking_balance,
+                'savings_balance': user.savings_balance,
+                'profile_image': user.profile_image,
+                'checking_account': user.checking_account,
+                'savings_account': user.savings_account,
+                'gps_address': user.gps_address,
+                'ghana_card_id': user.ghana_card_id,
+                'date_of_birth': user.date_of_birth.isoformat() if user.date_of_birth else None
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error fetching user: {str(e)}'}), 500
 
-@app.route('/transactions')
-@login_required
-def transactions():
-    user = User.query.get(session['user_id'])
-    all_transactions = Transaction.query.filter_by(user_id=user.id).order_by(Transaction.created_at.desc()).all()
-    return render_template('transactions.html', user=user, transactions=all_transactions)
+@app.route('/api/transactions', methods=['GET'])
+@jwt_required()
+def api_transactions():
+    try:
+        user_id = get_jwt_identity()
+        transactions = Transaction.query.filter_by(user_id=user_id).order_by(Transaction.created_at.desc()).all()
+        
+        return jsonify({
+            'success': True,
+            'transactions': [{
+                'id': txn.id,
+                'type': txn.transaction_type,
+                'amount': txn.amount,
+                'description': txn.description,
+                'account_type': txn.account_type,
+                'balance_after': txn.balance_after,
+                'date': txn.created_at.isoformat(),
+                'reference_id': txn.reference_id
+            } for txn in transactions]
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error fetching transactions: {str(e)}'}), 500
 
-@app.route('/pay_bills', methods=['GET', 'POST'])
-@login_required
-def pay_bills():
-    user = User.query.get(session['user_id'])
-    
-    if request.method == 'POST':
-        bill_type = request.form.get('bill_type')
-        provider = request.form.get('provider')
-        account_number = request.form.get('account_number')
-        amount = float(request.form.get('amount'))
-        payment_method = request.form.get('payment_method')
+@app.route('/api/transfer', methods=['POST'])
+@jwt_required()
+def api_transfer():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json()
+        
+        recipient_account = data.get('recipient_account')
+        amount = float(data.get('amount'))
+        from_account = data.get('from_account')
+        description = data.get('description', 'Internal transfer')
         
         # Validate amount
         if amount <= 0:
-            flash('Amount must be greater than zero', 'error')
-            return render_template('pay_bills.html', user=user)
+            return jsonify({'success': False, 'message': 'Amount must be greater than zero'}), 400
+        
+        # Find recipient
+        recipient_user = User.query.filter(
+            (User.checking_account == recipient_account) | (User.savings_account == recipient_account)
+        ).first()
+        
+        if not recipient_user:
+            return jsonify({'success': False, 'message': 'Recipient account not found'}), 404
+        
+        # Get sender user
+        user = User.query.get(user_id)
+        
+        # Check sender balance
+        if from_account == 'checking':
+            if user.checking_balance < amount:
+                return jsonify({'success': False, 'message': 'Insufficient funds in checking account'}), 400
+            user.checking_balance -= amount
+        else:
+            if user.savings_balance < amount:
+                return jsonify({'success': False, 'message': 'Insufficient funds in savings account'}), 400
+            user.savings_balance -= amount
+
+        # Deposit into recipient's account
+        if recipient_user.checking_account == recipient_account:
+            recipient_user.checking_balance += amount
+            recipient_account_type = 'checking'
+        else:
+            recipient_user.savings_balance += amount
+            recipient_account_type = 'savings'
+
+        # Create transactions for both sender and recipient
+        create_transaction(
+            user.id,
+            'debit',
+            amount,
+            f"Transfer to {recipient_user.full_name} ({recipient_account})",
+            from_account,
+            user.checking_balance if from_account == 'checking' else user.savings_balance
+        )
+        
+        create_transaction(
+            recipient_user.id,
+            'credit',
+            amount,
+            f"Transfer from {user.full_name} ({user.checking_account if from_account == 'checking' else user.savings_account})",
+            recipient_account_type,
+            recipient_user.checking_balance if recipient_account_type == 'checking' else recipient_user.savings_balance
+        )
+
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Transfer of ₵{amount:.2f} successful!',
+            'new_balance': user.checking_balance if from_account == 'checking' else user.savings_balance
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Transfer failed: {str(e)}'}), 500
+
+@app.route('/api/pay_bills', methods=['POST'])
+@jwt_required()
+def api_pay_bills():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json()
+        
+        bill_type = data.get('bill_type')
+        provider = data.get('provider')
+        account_number = data.get('account_number')
+        amount = float(data.get('amount'))
+        payment_method = data.get('payment_method')
+        
+        # Validate amount
+        if amount <= 0:
+            return jsonify({'success': False, 'message': 'Amount must be greater than zero'}), 400
+        
+        # Get user
+        user = User.query.get(user_id)
         
         # Check available balance
         if payment_method in ['checking', 'savings']:
             balance = user.checking_balance if payment_method == 'checking' else user.savings_balance
             if balance < amount:
-                flash('Insufficient funds', 'error')
-                return render_template('pay_bills.html', user=user)
+                return jsonify({'success': False, 'message': 'Insufficient funds'}), 400
             
             # Deduct from account
             if payment_method == 'checking':
@@ -600,631 +678,207 @@ def pay_bills():
         db.session.add(bill_payment)
         db.session.commit()
         
-        # Send confirmation email
-        send_email(
-            user.email,
-            'Bill Payment Confirmation',
-            'emails/bill_payment.html',
-            user=user,
-            bill_payment=bill_payment
-        )
+        return jsonify({
+            'success': True,
+            'message': 'Bill payment successful!',
+            'reference_id': bill_payment.reference_id,
+            'new_balance': user.checking_balance if payment_method == 'checking' else user.savings_balance
+        })
         
-        flash('Bill payment successful!', 'success')
-        return redirect(url_for('dashboard'))
-    
-    return render_template('pay_bills.html', user=user)
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Bill payment failed: {str(e)}'}), 500
 
-@app.route('/account_settings', methods=['GET', 'POST'])
-@login_required
-def account_settings():
-    user = User.query.get(session['user_id'])
-    
-    if request.method == 'POST':
-        # Update profile
-        if 'update_profile' in request.form:
-            full_name = request.form.get('full_name')
-            email = request.form.get('email')
-            phone = request.form.get('phone')
-            gps_address = request.form.get('gps_address')
-            date_of_birth = request.form.get('date_of_birth')
-            ghana_card_id = request.form.get('ghana_card_id')
-            
-            # Validate changes
-            if email != user.email and User.query.filter_by(email=email).first():
-                flash('Email already in use', 'error')
-                return redirect(url_for('account_settings'))
-                
-            if phone and phone != user.phone and User.query.filter_by(phone=phone).first():
-                flash('Phone number already in use', 'error')
-                return redirect(url_for('account_settings'))
-                
-            if ghana_card_id and ghana_card_id != user.ghana_card_id and User.query.filter_by(ghana_card_id=ghana_card_id).first():
-                flash('Ghana Card ID already in use', 'error')
-                return redirect(url_for('account_settings'))
-                
-            user.full_name = full_name
-            user.email = email
-            user.phone = phone
-            user.gps_address = gps_address
-            user.date_of_birth = datetime.strptime(date_of_birth, '%Y-%m-%d').date() if date_of_birth else None
-            user.ghana_card_id = ghana_card_id
-            
-            # Handle profile image upload
-            if 'profile_image' in request.files:
-                file = request.files['profile_image']
-                if file.filename != '':
-                    filename = save_profile_image(file, user.id)
-                    if filename:
-                        # Delete old image if exists
-                        if user.profile_image:
-                            try:
-                                old_image_path = os.path.join(app.config['UPLOAD_FOLDER'], user.profile_image)
-                                if os.path.exists(old_image_path):
-                                    os.remove(old_image_path)
-                            except OSError:
-                                pass
-                        user.profile_image = filename
-                        session['profile_image'] = filename
-            
-            db.session.commit()
-            flash('Profile updated successfully', 'success')
+@app.route('/api/fund_wallet', methods=['POST'])
+@jwt_required()
+def api_fund_wallet():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json()
         
-        # Change password
-        elif 'change_password' in request.form:
-            current_password = request.form.get('current_password')
-            new_password = request.form.get('new_password')
-            confirm_password = request.form.get('confirm_password')
-            
-            # Skip password check for Google users without password
-            if user.password_hash:
-                if not check_password_hash(user.password_hash, current_password):
-                    flash('Current password is incorrect', 'error')
-                    return redirect(url_for('account_settings'))
-            
-            if new_password != confirm_password:
-                flash('New passwords do not match', 'error')
-                return redirect(url_for('account_settings'))
-                
-            is_valid, message = validate_password(new_password)
-            if not is_valid:
-                flash(message, 'error')
-                return redirect(url_for('account_settings'))
-                
-            user.password_hash = generate_password_hash(new_password)
-            db.session.commit()
-            flash('Password changed successfully', 'success')
+        amount = float(data.get('amount'))
+        account_type = data.get('account_type', 'checking')
         
-        # Update accounts
-        elif 'update_accounts' in request.form:
-            checking_account = request.form.get('checking_account')
-            savings_account = request.form.get('savings_account')
-            
-            if checking_account != user.checking_account and User.query.filter_by(checking_account=checking_account).first():
-                flash('Checking account number already in use', 'error')
-                return redirect(url_for('account_settings'))
-                
-            if savings_account != user.savings_account and User.query.filter_by(savings_account=savings_account).first():
-                flash('Savings account number already in use', 'error')
-                return redirect(url_for('account_settings'))
-                
-            user.checking_account = checking_account
-            user.savings_account = savings_account
-            db.session.commit()
-            flash('Account numbers updated successfully', 'success')
-    
-    return render_template('account_settings.html', user=user)
-
-@app.route('/send_money', methods=['POST'])
-@login_required
-def send_money():
-    user = User.query.get(session['user_id'])
-    recipient = request.form.get('recipient')
-    amount = float(request.form.get('amount'))
-    from_account = request.form.get('from_account')
-    description = request.form.get('description', 'Money transfer')
-    
-    # Validate amount
-    if amount <= 0:
-        flash('Amount must be greater than zero', 'error')
-        return redirect(url_for('dashboard'))
-    
-    # Check sender balance
-    if from_account == 'checking':
-        if user.checking_balance < amount:
-            flash('Insufficient funds in checking account', 'error')
-            return redirect(url_for('dashboard'))
-        user.checking_balance -= amount
-    else:
-        if user.savings_balance < amount:
-            flash('Insufficient funds in savings account', 'error')
-            return redirect(url_for('dashboard'))
-        user.savings_balance -= amount
-    
-    # Find recipient (demo only - would be real lookup in production)
-    recipient_user = None
-    if '@' in recipient:
-        recipient_user = User.query.filter_by(email=recipient).first()
-    else:
-        recipient_user = User.query.filter_by(phone=recipient).first()
-    
-    # Create transactions
-    if recipient_user:
-        if from_account == 'checking':
-            recipient_user.checking_balance += amount
+        # Validate amount
+        if amount <= 0:
+            return jsonify({'success': False, 'message': 'Amount must be greater than zero'}), 400
+        
+        # Get user
+        user = User.query.get(user_id)
+        
+        # Update account balance
+        if account_type == 'checking':
+            user.checking_balance += amount
         else:
-            recipient_user.savings_balance += amount
-        
-        # Create transaction for sender
+            user.savings_balance += amount
+            
+        # Create transaction
         create_transaction(
             user.id,
-            'debit',
-            amount,
-            f"Transfer to {recipient_user.full_name}",
-            from_account,
-            user.checking_balance if from_account == 'checking' else user.savings_balance
-        )
-        
-        # Create transaction for recipient
-        create_transaction(
-            recipient_user.id,
             'credit',
             amount,
-            f"Transfer from {user.full_name}",
-            from_account,
-            recipient_user.checking_balance if from_account == 'checking' else recipient_user.savings_balance
+            'Wallet funding',
+            account_type,
+            user.checking_balance if account_type == 'checking' else user.savings_balance
         )
         
-        db.session.commit()
-        flash(f'Transfer of ₵{amount:.2f} to {recipient_user.full_name} successful!', 'success')
-    else:
-        flash('Recipient not found', 'error')
-    
-    return redirect(url_for('dashboard'))
-
-@app.route('/request_money', methods=['POST'])
-@login_required
-def request_money():
-    user = User.query.get(session['user_id'])
-    recipient = request.form.get('recipient')
-    amount = float(request.form.get('amount'))
-    message = request.form.get('message', 'Please send money')
-    
-    # Validate amount
-    if amount <= 0:
-        flash('Amount must be greater than zero', 'error')
-        return redirect(url_for('dashboard'))
-    
-    # Find recipient (demo only)
-    recipient_user = None
-    if '@' in recipient:
-        recipient_user = User.query.filter_by(email=recipient).first()
-    else:
-        recipient_user = User.query.filter_by(phone=recipient).first()
-    
-    if recipient_user:
-        # Send email notification
-        send_email(
-            recipient_user.email,
-            'Money Request',
-            'emails/money_request.html',
-            sender=user,
-            recipient=recipient_user,
+        # Create wallet funding record
+        wallet_funding = WalletFunding(
+            user_id=user.id,
             amount=amount,
-            message=message
+            account_type=account_type,
+            reference_id=f"FUND{secrets.token_hex(8).upper()}",
+            status='completed'
         )
-        flash(f'Money request sent to {recipient_user.full_name}', 'success')
-    else:
-        flash('Recipient not found', 'error')
-    
-    return redirect(url_for('dashboard'))
-
-@app.route('/forgot_password', methods=['GET', 'POST'])
-def forgot_password():
-    if request.method == 'POST':
-        email = request.form.get('email')
-        user = User.query.filter_by(email=email).first()
+        db.session.add(wallet_funding)
+        db.session.commit()
         
-        if user:
-            # Generate reset token
-            reset_token = secrets.token_urlsafe(32)
-            user.reset_token = reset_token
-            user.reset_token_expiry = datetime.utcnow() + timedelta(hours=1)
+        return jsonify({
+            'success': True,
+            'message': 'Wallet funded successfully!',
+            'new_balance': user.checking_balance if account_type == 'checking' else user.savings_balance
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Wallet funding failed: {str(e)}'}), 500
+
+@app.route('/api/budgets', methods=['GET', 'POST'])
+@jwt_required()
+def api_budgets():
+    try:
+        user_id = get_jwt_identity()
+        
+        if request.method == 'GET':
+            # Get all budgets for user
+            budgets = Budget.query.filter_by(user_id=user_id).all()
+            
+            return jsonify({
+                'success': True,
+                'budgets': [{
+                    'id': budget.id,
+                    'category': budget.category,
+                    'budget_amount': budget.budget_amount,
+                    'spent': budget.spent,
+                    'remaining': budget.budget_amount - budget.spent
+                } for budget in budgets]
+            })
+            
+        elif request.method == 'POST':
+            # Create new budget
+            data = request.get_json()
+            category = data.get('category')
+            budget_amount = float(data.get('budget_amount'))
+            
+            # Check if budget already exists
+            existing = Budget.query.filter_by(user_id=user_id, category=category).first()
+            if existing:
+                return jsonify({'success': False, 'message': 'Budget for this category already exists'}), 400
+            
+            # Create new budget
+            budget = Budget(
+                user_id=user_id,
+                category=category,
+                budget_amount=budget_amount
+            )
+            
+            db.session.add(budget)
             db.session.commit()
             
-            # Send reset email
-            reset_link = url_for('reset_password', token=reset_token, _external=True)
-            send_email(
-                user.email,
-                'Password Reset Request',
-                'emails/password_reset.html',
-                user=user,
-                reset_link=reset_link
-            )
+            return jsonify({
+                'success': True,
+                'message': 'Budget created successfully!',
+                'budget': {
+                    'id': budget.id,
+                    'category': budget.category,
+                    'budget_amount': budget.budget_amount,
+                    'spent': budget.spent
+                }
+            })
+            
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Budget operation failed: {str(e)}'}), 500
+
+@app.route('/api/budgets/<int:budget_id>', methods=['PUT', 'DELETE'])
+@jwt_required()
+def api_budget(budget_id):
+    try:
+        user_id = get_jwt_identity()
+        budget = Budget.query.get_or_404(budget_id)
         
-        flash('If an account with that email exists, a password reset link has been sent', 'info')
-        return redirect(url_for('login'))
-    
-    return render_template('forgot_password.html')
-
-@app.route('/reset_password/<token>', methods=['GET', 'POST'])
-def reset_password(token):
-    user = User.query.filter_by(reset_token=token).first()
-    
-    if not user or user.reset_token_expiry < datetime.utcnow():
-        flash('Invalid or expired reset token', 'error')
-        return redirect(url_for('forgot_password'))
-    
-    if request.method == 'POST':
-        password = request.form.get('password')
-        confirm_password = request.form.get('confirm_password')
+        # Validate user ownership
+        if budget.user_id != user_id:
+            return jsonify({'success': False, 'message': 'Unauthorized'}), 403
         
-        if password != confirm_password:
-            flash('Passwords do not match', 'error')
-            return render_template('reset_password.html', token=token)
-        
-        is_valid, message = validate_password(password)
-        if not is_valid:
-            flash(message, 'error')
-            return render_template('reset_password.html', token=token)
-        
-        # Update password
-        user.password_hash = generate_password_hash(password)
-        user.reset_token = None
-        user.reset_token_expiry = None
-        db.session.commit()
-        
-        flash('Your password has been reset successfully', 'success')
-        return redirect(url_for('login'))
-    
-    return render_template('reset_password.html', token=token)
+        if request.method == 'PUT':
+            # Update budget
+            data = request.get_json()
+            budget.budget_amount = float(data.get('budget_amount', budget.budget_amount))
+            budget.spent = float(data.get('spent', budget.spent))
+            
+            db.session.commit()
+            
+            return jsonify({
+                'success': True,
+                'message': 'Budget updated successfully!',
+                'budget': {
+                    'id': budget.id,
+                    'category': budget.category,
+                    'budget_amount': budget.budget_amount,
+                    'spent': budget.spent
+                }
+            })
+            
+        elif request.method == 'DELETE':
+            # Delete budget
+            db.session.delete(budget)
+            db.session.commit()
+            
+            return jsonify({'success': True, 'message': 'Budget deleted successfully!'})
+            
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Budget operation failed: {str(e)}'}), 500
 
-@app.route('/budget')
-@login_required
-def budget():
-    user = User.query.get(session['user_id'])
-    budgets = Budget.query.filter_by(user_id=user.id).all()
-    
-    # Calculate total budget and spending
-    total_budget = sum(b.budget_amount for b in budgets)
-    total_spent = sum(b.spent for b in budgets)
-    
-    return render_template('budgeting.html', 
-                          user=user, 
-                          budgets=budgets,
-                          total_budget=total_budget,
-                          total_spent=total_spent)
+# Existing web routes (keep these for web interface)
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-@app.route('/add_budget', methods=['POST'])
-@login_required
-def add_budget():
-    user = User.query.get(session['user_id'])
-    category = request.form.get('category')
-    amount = float(request.form.get('amount'))
-    
-    # Check if budget already exists
-    existing = Budget.query.filter_by(user_id=user.id, category=category).first()
-    if existing:
-        flash('Budget for this category already exists', 'error')
-        return redirect(url_for('budget'))
-    
-    # Create new budget
-    budget = Budget(
-        user_id=user.id,
-        category=category,
-        budget_amount=amount
-    )
-    
-    db.session.add(budget)
-    db.session.commit()
-    
-    flash('Budget category added!', 'success')
-    return redirect(url_for('budget'))
+@app.route('/')
+def index():
+    if 'user_id' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
 
-@app.route('/update_budget/<int:id>', methods=['POST'])
-@login_required
-def update_budget(id):
-    budget = Budget.query.get_or_404(id)
-    
-    # Validate user ownership
-    if budget.user_id != session['user_id']:
-        flash('Unauthorized action', 'error')
-        return redirect(url_for('budget'))
-    
-    # Update budget
-    budget.budget_amount = float(request.form.get('amount'))
-    budget.spent = float(request.form.get('spent'))
-    db.session.commit()
-    
-    flash('Budget updated!', 'success')
-    return redirect(url_for('budget'))
+# ... (keep all your existing web routes below this point) ...
 
-@app.route('/delete_budget/<int:id>')
-@login_required
-def delete_budget(id):
-    budget = Budget.query.get_or_404(id)
-    
-    # Validate user ownership
-    if budget.user_id != session['user_id']:
-        flash('Unauthorized action', 'error')
-        return redirect(url_for('budget'))
-    
-    db.session.delete(budget)
-    db.session.commit()
-    
-    flash('Budget category deleted!', 'success')
-    return redirect(url_for('budget'))
-
-@app.route('/link_external_account', methods=['POST'])
-@login_required
-def link_external_account():
-    user = User.query.get(session['user_id'])
-    bank_code = request.form.get('bank_code')
-    account_name = request.form.get('account_name')
-    account_number = request.form.get('account_number')
-    
-    # Check if account already linked
-    existing = ExternalBankAccount.query.filter_by(
-        user_id=user.id,
-        bank_code=bank_code,
-        account_number=account_number
-    ).first()
-    
-    if existing:
-        flash('This account is already linked', 'error')
-        return redirect(url_for('bank_hub'))
-    
-    # Create new linked account
-    bank_account = ExternalBankAccount(
-        user_id=user.id,
-        bank_code=bank_code,
-        account_name=account_name,
-        account_number=account_number
-    )
-    
-    db.session.add(bank_account)
-    db.session.commit()
-    
-    flash('Bank account linked successfully!', 'success')
-    return redirect(url_for('bank_hub'))
-
-@app.route('/unlink_bank_account/<int:id>')
-@login_required
-def unlink_bank_account(id):
-    bank_account = ExternalBankAccount.query.get_or_404(id)
-    
-    # Validate user ownership
-    if bank_account.user_id != session['user_id']:
-        flash('Unauthorized action', 'error')
-        return redirect(url_for('bank_hub'))
-    
-    db.session.delete(bank_account)
-    db.session.commit()
-    
-    flash('Bank account unlinked successfully!', 'success')
-    return redirect(url_for('bank_hub'))
-
-@app.route('/transfer_external', methods=['POST'])
-@login_required
-def transfer_external():
-    user = User.query.get(session['user_id'])
-    bank_name = request.form.get('bank_name')
-    recipient_account = request.form.get('recipient_account')
-    amount = float(request.form.get('amount'))
-    from_account = request.form.get('from_account')
-    description = request.form.get('description', 'External transfer')
-    
-    # Validate amount
-    if amount <= 0:
-        flash('Amount must be greater than zero', 'error')
-        return redirect(url_for('bank_hub'))
-    
-    # Check sender balance
-    if from_account == 'checking':
-        if user.checking_balance < amount:
-            flash('Insufficient funds in checking account', 'error')
-            return redirect(url_for('bank_hub'))
-        user.checking_balance -= amount
-    else:
-        if user.savings_balance < amount:
-            flash('Insufficient funds in savings account', 'error')
-            return redirect(url_for('bank_hub'))
-        user.savings_balance -= amount
-    
-    # Create transaction
-    create_transaction(
-        user.id,
-        'debit',
-        amount,
-        f"External transfer to {bank_name} - {recipient_account}",
-        from_account,
-        user.checking_balance if from_account == 'checking' else user.savings_balance
-    )
-    
-    # Create external transaction record
-    external_txn = ExternalTransaction(
-        user_id=user.id,
-        transaction_type='debit',
-        amount=amount,
-        description=description,
-        status='completed',
-        reference_id=f"EXT{secrets.token_hex(8).upper()}"
-    )
-    
-    db.session.add(external_txn)
-    db.session.commit()
-    
-    flash(f'Transfer of ₵{amount:.2f} to {bank_name} successful!', 'success')
-    return redirect(url_for('bank_hub'))
-
-@app.route('/api/transactions')
-@login_required
-def api_transactions():
-    user = User.query.get(session['user_id'])
-    transactions = Transaction.query.filter_by(user_id=user.id).order_by(Transaction.created_at.desc()).limit(10).all()
-    
-    return jsonify([{
-        'type': txn.transaction_type,
-        'amount': txn.amount,
-        'description': txn.description,
-        'date': txn.created_at.strftime('%Y-%m-%d %H:%M'),
-        'balance': txn.balance_after
-    } for txn in transactions])
-
-@app.route('/api/balance')
-@login_required
-def api_balance():
-    user = User.query.get(session['user_id'])
-    return jsonify({
-        'checking': user.checking_balance,
-        'savings': user.savings_balance
-    })
-
-# Add the new 'transfer' endpoint
-@app.route('/transfer', methods=['POST'])
-@login_required
-def transfer():
-    user = User.query.get(session['user_id'])
-    recipient_account = request.form.get('recipient_account')
-    amount = float(request.form.get('amount'))
-    from_account = request.form.get('from_account')
-    description = request.form.get('description', 'Internal transfer')
-    
-    # Validate amount
-    if amount <= 0:
-        flash('Amount must be greater than zero', 'error')
-        return redirect(url_for('bank_hub'))
-    
-    # Find recipient by their checking or savings account number
-    recipient_user = User.query.filter(
-        (User.checking_account == recipient_account) | (User.savings_account == recipient_account)
-    ).first()
-    
-    if not recipient_user:
-        flash('Recipient account not found', 'error')
-        return redirect(url_for('bank_hub'))
-    
-    # Prevent self-transfer
-    if recipient_user.id == user.id:
-        flash('Cannot transfer to your own account', 'error')
-        return redirect(url_for('bank_hub'))
-        
-    # Check sender balance
-    if from_account == 'checking':
-        if user.checking_balance < amount:
-            flash('Insufficient funds in checking account', 'error')
-            return redirect(url_for('bank_hub'))
-        user.checking_balance -= amount
-    else:
-        if user.savings_balance < amount:
-            flash('Insufficient funds in savings account', 'error')
-            return redirect(url_for('bank_hub'))
-        user.savings_balance -= amount
-
-    # Deposit into recipient's account
-    if recipient_user.checking_account == recipient_account:
-        recipient_user.checking_balance += amount
-        recipient_account_type = 'checking'
-    else:
-        recipient_user.savings_balance += amount
-        recipient_account_type = 'savings'
-
-    # Create transactions for both sender and recipient
-    create_transaction(
-        user.id,
-        'debit',
-        amount,
-        f"Transfer to {recipient_user.full_name} ({recipient_account})",
-        from_account,
-        user.checking_balance if from_account == 'checking' else user.savings_balance
-    )
-    
-    create_transaction(
-        recipient_user.id,
-        'credit',
-        amount,
-        f"Transfer from {user.full_name} ({user.checking_account if from_account == 'checking' else user.savings_account})",
-        recipient_account_type,
-        recipient_user.checking_balance if recipient_account_type == 'checking' else recipient_user.savings_balance
-    )
-
-    db.session.commit()
-    flash(f'Transfer of ₵{amount:.2f} to {recipient_user.full_name} successful!', 'success')
-    return redirect(url_for('bank_hub'))
-
-# Fully implemented map route
-@app.route('/map_view')
-@login_required
-def map_view():
-    user = User.query.get(session['user_id'])
-
-    # Sample agent locations (latitude, longitude)
-    agent_locations = [
-        (5.6037, -0.1870, 'Accra Main Branch'),
-        (5.5780, -0.2188, 'Osu Agent Point'),
-        (5.6148, -0.2058, 'Kwame Nkrumah Circle Office'),
-        (6.6885, -1.6244, 'Kumasi Branch'),
-        (4.9009, -1.7486, 'Takoradi Agent'),
-        (5.1009, -1.2612, 'Cape Coast Agent')
-    ]
-
-    # Create a map centered on Ghana
-    m = folium.Map(location=[7.9465, -1.0232], zoom_start=6)
-
-    # Add markers for each agent location
-    for lat, lon, name in agent_locations:
-        folium.Marker(
-            location=[lat, lon],
-            popup=name,
-            tooltip=name,
-            icon=folium.Icon(color='blue', icon='info-sign')
-        ).add_to(m)
-
-    # Save map to an HTML string
-    map_html = m.get_root().render()
-
-    return render_template('map_view.html', user=user, map_html=map_html)
-
+# Error handlers
 @app.errorhandler(404)
 def not_found(error):
+    if request.path.startswith('/api/'):
+        return jsonify({'success': False, 'message': 'Endpoint not found'}), 404
     return render_template('404.html'), 404
 
 @app.errorhandler(500)
 def internal_error(error):
     db.session.rollback()
+    if request.path.startswith('/api/'):
+        return jsonify({'success': False, 'message': 'Internal server error'}), 500
     return render_template('500.html'), 500
 
-# Start local SMTP server for development
-def start_smtp_server():
-    from aiosmtpd.controller import Controller
-    from aiosmtpd.handlers import Message
-    
-    class DebuggingHandler:
-        async def handle_DATA(self, server, session, envelope):
-            print(f"Received message from: {envelope.mail_from}")
-            print(f"To: {envelope.rcpt_tos}")
-            print(f"Message data:\n{envelope.content.decode('utf8', errors='replace')}")
-            print("=" * 50)
-            return '250 Message accepted for delivery'
-    
-    controller = Controller(DebuggingHandler(), hostname='127.0.0.1', port=1025)
-    controller.start()
-    print("SMTP server started on localhost:1025")
-    return controller
+@app.errorhandler(401)
+def unauthorized(error):
+    if request.path.startswith('/api/'):
+        return jsonify({'success': False, 'message': 'Authentication required'}), 401
+    return redirect(url_for('login'))
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
 
-    smtp_controller = None
-    # The reloader (when debug=True) sets this environment variable.
-    # We only want to start the SMTP server in the main "watcher" process,
-    # not in the reloaded "worker" process.
-    if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-        smtp_controller = start_smtp_server()
-
-    try:
-        app.run(debug=True, host='0.0.0.0', port=5000)
-    finally:
-        if smtp_controller:
-            print("Stopping SMTP server...")
-            smtp_controller.stop()
+    # Start development server
+    app.run(debug=os.environ.get('FLASK_DEBUG', 'False').lower() == 'true', 
+            host='0.0.0.0', 
+            port=int(os.environ.get('PORT', 5000)))
