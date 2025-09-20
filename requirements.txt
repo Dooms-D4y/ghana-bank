@@ -10,3 +10,4 @@ folium
 gunicorn
 aiosmtpd
 Flask-Cors
+PyJWT
